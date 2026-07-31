@@ -75,7 +75,7 @@ sequenceDiagram
 
             opt falha de infra em qualquer etapa (após retries)
                 BG->>LOG: step_failed (failedAtStep, error_type, retryCount)
-                Note over BG,LOG: Sem tabela de replay — diagnóstico via log; Digisac pode reentregar a mensagem
+                Note over BG,LOG: Sem tabela de replay — diagnóstico via log Digisac pode reentregar a mensagem
             end
         end
     end
