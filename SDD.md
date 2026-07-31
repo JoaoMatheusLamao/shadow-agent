@@ -1,6 +1,6 @@
 # SDD.md — Software Design Document
 **Projeto:** Middleware/Oráculo de IA para Suporte ao Cliente
-**Status:** Stack e decisões-chave de MVP definidas — plataforma de suporte pendente
+**Status:** Stack e decisões-chave de MVP definidas — plataforma de suporte definida (Digisac)
 **Metodologia:** Spec-Driven Development (GitHub Spec Kit)
 
 > Este documento segue a estrutura recomendada pelo Spec Kit (`specify`), adaptada
@@ -115,10 +115,29 @@ produção sob alta concorrência" (onde Node tem vantagem natural) e passa a se
 ecossistema Python. Como o volume de mensagens de um MVP é, por definição,
 baixo/moderado, o risco de bloquear o event loop é aceitável neste estágio.
 
-**Decisão final:** Python 3.12 + FastAPI + Postgres/pgvector + BackgroundTasks
-(sem fila dedicada) + OpenRouter como provedor de LLM.
-**Data:** 2026-07-19
+**Decisão final:** Python 3.12 + FastAPI + BackgroundTasks (sem fila dedicada) +
+OpenRouter como provedor de LLM. **Sem banco de dados no MVP.**
+**Data:** 2026-07-19 (revisado 2026-07-30)
 **Responsável:** usuário do projeto
+
+> **Atualização 2026-07-30 (a):** plataforma definida como **Digisac**; base de
+> conhecimento passou a ser um **Excel em `docs/`** consultado diretamente; pgvector
+> **adiado para pós-MVP**.
+>
+> **Atualização 2026-07-30 (b) — SEM PERSISTÊNCIA:** por decisão de custo, o MVP
+> **não usa banco de dados**. Consequências (substituem as menções a Postgres/tabelas
+> nas seções 3 e 4): (1) **deduplicação** via **cache em memória com TTL** (volátil,
+> *best-effort* — não `UNIQUE` durável); (2) **histórico do ticket** buscado ao vivo
+> na **API do Digisac** (não há tabela `messages`); (3) **falhas** em **logs
+> estruturados** (não há `failed_messages`); (4) **sem PII em repouso** ⇒ retenção de
+> 90 dias sem job de expurgo. O sistema opera **apenas com retries e logs**.
+>
+> **Atualização 2026-07-30 (c) — modelo e hospedagem:** modelo LLM default
+> **`google/gemini-3.1-flash-lite`** (melhor custo-benefício PT-BR + latência),
+> configurável; fallback `openai/gpt-5.4-mini`; ultra-econômico
+> `deepseek/deepseek-v4-flash`. Hospedagem eleita **DigitalOcean App Platform
+> (~US$5/mês, só infra)**; alternativa Hetzner CX23 (~US$4,3). Ver `research.md` do
+> plano (D6, D11).
 
 **Gatilho de reavaliação:** se o volume de mensagens ou os requisitos de
 confiabilidade de entrega crescerem a ponto de a perda ocasional de mensagem em
@@ -133,9 +152,15 @@ ver seção 3.3).
 
 ### 3.1 Fluxo de Dados (MVP — sem fila dedicada)
 
+> **⚠ Diagrama supersedido.** O ASCII abaixo reflete o desenho anterior (com
+> Postgres: `processed_events`, `failed_messages`). No MVP vigente **não há banco**
+> (Atualização 2026-07-30 (b)): dedup em cache de memória, histórico via API do
+> Digisac, falhas em log. **Fluxo canônico e atualizado:**
+> `specs/001-webhook-rag-flow/design/flow-sequence.md` (diagrama mermaid, artefato vivo).
+
 ```
 ┌──────────────────┐
-│  Plataforma de    │   (a definir — Zendesk / Blip / Intercom)
+│  Plataforma de    │   (Digisac)
 │  Suporte          │
 └─────────┬─────────┘
           │ (1) POST /webhooks/{platform}
@@ -157,7 +182,8 @@ ver seção 3.3).
 │                                                │
 │  (2a) RetrieveContext                          │
 │    ┌────────────────────────────────────┐     │
-│    │  pgvector (mesmo Postgres)          │     │
+│    │  Histórico do ticket aberto (Digisac)│    │
+│    │  + base de conhecimento (Excel/docs) │    │
 │    │  + APIs internas do cliente         │     │
 │    │    (CRM, pedidos, faturas)          │     │
 │    │  retry manual c/ backoff curto      │     │
@@ -205,23 +231,24 @@ Transversal a todas as etapas:
 
 ```
 Domain
-  ├─ Entities: Conversation, Message, Persona, KnowledgeChunk
+  ├─ Entities: Conversation, Message, Persona, KnowledgeEntry
   └─ Sem dependência externa (nenhum SDK, nenhum framework HTTP)
 
 Application (Use Cases)
   ├─ ReceiveWebhookEvent
   ├─ ProcessIncomingMessage
-  ├─ RetrieveContext        → depende de: RagPort, ClientApiPort
+  ├─ RetrieveContext        → depende de: KnowledgePort, ClientApiPort
   ├─ GenerateResponse        → depende de: LLMProviderPort
   └─ DispatchResponse        → depende de: SupportPlatformPort
 
 Adapters (Infra)
   ├─ inbound/
-  │   └─ webhooks/mockAdapter.py   # até a plataforma real ser decidida
+  │   └─ webhooks/digisacAdapter.py   # recebe o webhook do Digisac
   ├─ outbound/
   │   ├─ llm/openRouterAdapter.py
-  │   ├─ rag/pgvectorAdapter.py
-  │   └─ platform/mockReplyAdapter.py   # idem
+  │   ├─ knowledge/excelAdapter.py    # lê a base de conhecimento (docs/*.xlsx)
+  │   │                               # pgvectorAdapter: adiado p/ pós-MVP
+  │   └─ platform/digisacReplyAdapter.py   # envia a resposta via API do Digisac
 ```
 
 ### 3.3 Portas (Interfaces) Centrais — MVP
@@ -234,8 +261,8 @@ SupportPlatformPort
 LLMProviderPort
   - generate(context: RetrievedContext, persona: Persona) → GeneratedResponse
 
-RagPort
-  - retrieve(query: string, tenantId: string) → KnowledgeChunk[]
+KnowledgePort              # no MVP: implementado pelo excelAdapter (docs/*.xlsx)
+  - retrieve(query: string, tenantId: string) → KnowledgeEntry[]
 
 # QueuePort NÃO é implementado no MVP. Mantida aqui apenas como documentação
 # do ponto de extensão futuro (ver "Gatilho de reavaliação" em 2.4) — não crie
@@ -247,13 +274,21 @@ QueuePort (reservado, não implementado no MVP)
 
 ---
 
-## 4. Modelo de Dados (MVP — tudo no mesmo Postgres)
+## 4. Modelo de Dados
+
+> **⚠ SUPERSEDIDO pela Atualização 2026-07-30 (b): SEM BANCO no MVP.** As tabelas
+> abaixo descrevem o desenho **anterior** com Postgres e são mantidas apenas como
+> referência histórica / desenho de evolução (quando/se a persistência voltar). No
+> MVP atual **nada disto é persistido**: `Conversation`/`Message` são objetos
+> transitórios em memória; `ProcessedEvent` vira **cache de dedup em memória (TTL)**;
+> `FailedMessage` vira **evento de log estruturado**; `KnowledgeEntry` é lido do
+> Excel. Ver `specs/001-webhook-rag-flow/data-model.md` para o modelo vigente.
 
 ```
 Conversation
   - id
   - tenantId              # fixo/único no MVP (single-tenant)
-  - platform (mock | zendesk | blip | intercom — conforme decisão futura)
+  - platform (digisac — extensível a outras plataformas no futuro)
   - externalConversationId
   - status (open | escalated | closed)
   - createdAt / updatedAt
@@ -280,12 +315,11 @@ FailedMessage              # substitui DLQ no MVP
   - retryCount
   - createdAt
 
-KnowledgeChunk              # RAG via pgvector, mesma instância de Postgres
-  - id
-  - tenantId
-  - content
-  - embedding (vector)
-  - sourceRef
+KnowledgeEntry              # base de conhecimento no MVP: lida do Excel (docs/)
+  - id                       # não persistido em Postgres no MVP; carregado do
+  - tenantId                 # arquivo Excel. Sem coluna embedding enquanto pgvector
+  - content                  # estiver adiado (ver gatilho de evolução na seção 7).
+  - sourceRef                # (ex.: aba/linha do Excel de origem)
 ```
 
 ---
@@ -297,8 +331,9 @@ KnowledgeChunk              # RAG via pgvector, mesma instância de Postgres
 | Latência de ACK do webhook | < 2s (p99) |
 | Latência ponta a ponta (webhook → resposta enviada) | < 15s (p95) — sujeito a validação com o cliente |
 | Disponibilidade do endpoint de webhook | ≥ 99.9% (best-effort no MVP, sem SLA formal) |
-| Retenção de dados de conversa | 90 dias (Message, processed_events.rawPayload) |
-| Multi-tenancy | Single-tenant no MVP; `tenantId` presente no schema para evolução futura |
+| Retenção de dados de conversa | **N/A no MVP** — sem persistência / sem PII em repouso (nada armazenado); regra retorna se a persistência voltar |
+| Custo de infra (nosso projeto) | ~US$5/mês (DigitalOcean App Platform) — OpenRouter/Digisac fora da conta |
+| Multi-tenancy | Single-tenant no MVP; `tenantId` presente nos objetos para evolução futura |
 | Taxa de escalonamento para humano | Métrica a monitorar, sem meta fixa inicial |
 
 ---
@@ -307,25 +342,46 @@ KnowledgeChunk              # RAG via pgvector, mesma instância de Postgres
 
 1. `/constitution` — formalizar os princípios da seção 3 do `CLAUDE.md` como
    constitution do Spec Kit, se ainda não gerada.
-2. `/specify` — detalhar a spec funcional do primeiro slice: webhook mock →
-   RAG (pgvector) → OpenRouter → resposta mock, ponta a ponta.
+2. `/specify` — detalhar a spec funcional do primeiro slice: webhook do Digisac →
+   contexto do ticket + conhecimento (Excel/docs) → OpenRouter → resposta enviada
+   ao Digisac, ponta a ponta. **(feito — ver `specs/001-webhook-rag-flow`)**
 3. `/plan` — a partir da decisão de stack (seção 2.4) e da arquitetura (seção
    3), gerar o plano técnico de implementação desse primeiro slice vertical.
 4. `/tasks` — quebrar o plano em tarefas executáveis.
-5. Quando a plataforma de suporte for escolhida, `/specify` novamente para o
-   adapter real, substituindo o mock sem tocar em Domain/Application.
+5. Plataforma escolhida (Digisac): o adapter de entrada/saída é implementado
+   contra `SupportPlatformPort`, sem tocar em Domain/Application. Se a base de
+   conhecimento crescer, `/specify` para a evolução com pgvector/busca semântica.
 
 ---
 
 ## 7. Perguntas em Aberto
 
-- [ ] Qual plataforma de suporte será integrada primeiro? — **pendente**,
-      adapter mock em uso enquanto isso.
+- [x] Qual plataforma de suporte será integrada primeiro? — **Digisac**
+      (definido em 2026-07-30). Entrada via webhook do Digisac, saída via API do
+      Digisac (OAuth2 Bearer). Detalhes de payload/endpoint a confirmar no `/plan`.
 - [x] Qual provedor de LLM é o padrão? — **OpenRouter**.
-- [x] Qual vector DB / estratégia de RAG? — **pgvector**, busca vetorial direta
-      (sem pipeline de retrieval híbrido no MVP).
-- [x] Qual é a política de retenção de dados de conversa (LGPD)? — **90 dias**.
+- [x] Qual vector DB / estratégia de RAG? — **pgvector adiado para pós-MVP**. No
+      MVP a base de conhecimento é um **arquivo Excel em `docs/`**, consultado
+      diretamente (base pequena, sem banco vetorial). pgvector/busca semântica
+      vira gatilho de evolução quando a base crescer ou a busca direta deixar de
+      ser suficiente.
+- [x] Usar banco de dados no MVP? — **NÃO** (decisão 2026-07-30, custo). Sem
+      persistência: dedup em cache de memória (TTL, volátil), histórico via API do
+      Digisac, falhas em logs. Reintroduzir store durável (Redis/Postgres) é gatilho
+      de evolução se dedup pós-restart/perda em crash deixarem de ser aceitáveis.
+- [x] Qual é a política de retenção de dados de conversa (LGPD)? — **N/A no MVP**:
+      sem PII em repouso (nada persistido). Volta a valer (90 dias + expurgo) se a
+      persistência de conteúdo for reintroduzida.
 - [x] Multi-tenancy desde o dia 1, ou single-tenant? — **single-tenant no MVP**,
       `tenantId` já no schema.
-- [ ] Qual o critério de confiança mínimo para não escalonar para humano? —
-      **pendente**, definir ao especificar o use case `GenerateResponse`.
+- [~] Qual o critério de confiança mínimo para não escalonar para humano? —
+      **default definido no spec 001** (escalonar quando não há conteúdo relevante
+      no Excel ou a LLM sinaliza incerteza); critério numérico fino a detalhar no
+      `/plan` ao desenhar `GenerateResponse`.
+- [x] Onde hospedar (custo mensal)? — **DigitalOcean App Platform** (~US$5/mês, só
+      infra), container único sempre-ligado (o background pós-ACK exige instância
+      viva ⇒ evitar scale-to-zero). Alternativa mais barata: Hetzner CX23 (~US$4,3).
+      Evitar Cloud Run/Lambda neste padrão. Ver `research.md` D11.
+- [x] Qual modelo no OpenRouter? — default **`google/gemini-3.1-flash-lite`**
+      (custo-benefício PT-BR + latência), configurável; fallback
+      `openai/gpt-5.4-mini`; ultra-econômico `deepseek/deepseek-v4-flash`. Ver D6.
